@@ -29,11 +29,18 @@ LOGFILE="$STATE_DIR/ssh.log"
 SSH_KEY_ARGS="${ISH_SSH_KEY_ARGS:--o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3}"
 MARK='ssh root@'"$PHONE_IP"' -N -D'
 
-# The env a client needs. socks5h (not socks5) so the PHONE resolves names,
-# which keeps DNS inside the tunnel instead of leaking to the LAN.
+# The env a client needs.
+#
+# all_proxy points at privoxy, NOT at the SOCKS port, and that is deliberate.
+# socks5h:// is a curl-ism: aria2 parses it, rejects it, and aborts the whole
+# download with "unrecognized proxy format". aria2 only accepts http:// and
+# ftp:// proxy URLs. Since privoxy already bridges HTTP to SOCKS5, pointing
+# everything at it loses nothing — the hostname still travels in the request
+# line, so the phone resolves it and DNS stays inside the tunnel. Tools that
+# genuinely need SOCKS5 still have 127.0.0.1:$SOCKS_PORT to ask for directly.
 proxy_env() {
-    echo "all_proxy=socks5h://127.0.0.1:$SOCKS_PORT"
-    echo "ALL_PROXY=socks5h://127.0.0.1:$SOCKS_PORT"
+    echo "all_proxy=http://127.0.0.1:$HTTP_PORT"
+    echo "ALL_PROXY=http://127.0.0.1:$HTTP_PORT"
     echo "http_proxy=http://127.0.0.1:$HTTP_PORT"
     echo "HTTP_PROXY=http://127.0.0.1:$HTTP_PORT"
     echo "https_proxy=http://127.0.0.1:$HTTP_PORT"
