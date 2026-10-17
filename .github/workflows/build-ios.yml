@@ -9,6 +9,10 @@
 # configuration that links `Vendor/HevSocks5Server.xcframework` — a gitignored,
 # uncommitted binary that does not exist in a fresh clone. `-scheme` therefore
 # cannot build here. We build by `-target` instead and zip the .app ourselves.
+#
+# Corollary: do not add `-derivedDataPath`. xcodebuild requires `-scheme` (or
+# -testProductsPath / -xctestrun) alongside it, and that is exactly what we
+# cannot use. CONFIGURATION_BUILD_DIR controls the output location instead.
 name: build-ios
 
 on:
@@ -50,7 +54,6 @@ jobs:
             -target SocksBypass \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath "$PWD/.derivedData" \
             CONFIGURATION_BUILD_DIR="$PWD/build/ios" \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
@@ -63,12 +66,19 @@ jobs:
       - name: Package ipa
         run: |
           set -euo pipefail
-          APP="build/ios/SocksBypass.app"
-          if [ ! -d "$APP" ]; then
-            echo "ERROR: expected .app not found at $APP" >&2
-            find build -maxdepth 3 -name '*.app' -print >&2 || true
+          # CONFIGURATION_BUILD_DIR should put the product at build/ios/, but do not
+          # bet the run on it: locate the .app wherever it actually landed. Legacy
+          # -target builds honour the override, but if a future Xcode ignores it the
+          # product would appear under build/<Config>-<sdk>/ instead, and that should
+          # be a warning rather than a failed run.
+          APP="$(find . -maxdepth 4 -name 'SocksBypass.app' -type d \
+                  -not -path './.git/*' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "ERROR: no SocksBypass.app was produced. Directory tree:" >&2
+            find . -maxdepth 4 -type d -not -path './.git/*' >&2
             exit 1
           fi
+          echo "Packaging app from: $APP"
           STAGE="$(mktemp -d)"
           mkdir -p "$STAGE/Payload"
           cp -a "$APP" "$STAGE/Payload/"
