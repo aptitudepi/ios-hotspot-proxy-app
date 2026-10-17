@@ -1,0 +1,37 @@
+# Xcode
+xcuserdata/
+build/
+DerivedData/
+.derivedData/
+*.xcuserstate
+*.xcworkspace
+!default.xcworkspace
+
+# macOS
+.DS_Store
+
+# Build products
+*.ipa
+*.app
+*.dSYM.zip
+*.dSYM
+
+# Reproducible third-party source/build output
+Vendor/
+
+
+# Agent worktrees and local session state
+.claude/
+__pycache__/
+*.pyc
+
+# Android / Gradle
+android/.gradle/
+android/**/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/captures/
+*.apk
+*.aab
+.cxx/

@@ -1,0 +1,86 @@
+# Build an unsigned device .ipa for ios-hotspot-proxy-app.
+#
+# CI holds NO Apple credentials and never will. Signing happens on the operator's
+# Linux box at install time (Legacy iOS Kit / PlumeImpactor), so this workflow's
+# only job is to produce a linkable unsigned artifact.
+#
+# Build path note: there is no shared `SocksBypass` scheme. The only shared
+# scheme is `SocksBypass-Benchmark`, whose archive action is pinned to a build
+# configuration that links `Vendor/HevSocks5Server.xcframework` — a gitignored,
+# uncommitted binary that does not exist in a fresh clone. `-scheme` therefore
+# cannot build here. We build by `-target` instead and zip the .app ourselves.
+name: build-ios
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-ios-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Unsigned device ipa
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+
+      - name: Build (unsigned, device)
+        env:
+          # Unsigned on purpose. No certificate, no profile, no provisioning.
+          CODE_SIGNING_ALLOWED: "NO"
+          CODE_SIGNING_REQUIRED: "NO"
+          CODE_SIGN_IDENTITY: ""
+          CODE_SIGN_ENTITLEMENTS: ""
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project SocksBypass.xcodeproj \
+            -target SocksBypass \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$PWD/.derivedData" \
+            CONFIGURATION_BUILD_DIR="$PWD/build/ios" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            ENABLE_BITCODE=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package ipa
+        run: |
+          set -euo pipefail
+          APP="build/ios/SocksBypass.app"
+          if [ ! -d "$APP" ]; then
+            echo "ERROR: expected .app not found at $APP" >&2
+            find build -maxdepth 3 -name '*.app' -print >&2 || true
+            exit 1
+          fi
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/Payload"
+          cp -a "$APP" "$STAGE/Payload/"
+          # A .ipa is a zip with the app under Payload/. Signing happens later.
+          ( cd "$STAGE" && zip -qry "$GITHUB_WORKSPACE/SocksBypass-unsigned.ipa" Payload )
+          rm -rf "$STAGE"
+          ls -l SocksBypass-unsigned.ipa
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v7
+        with:
+          name: SocksBypass-unsigned-ipa
+          path: SocksBypass-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
