@@ -35,3 +35,8 @@ android/captures/
 *.apk
 *.aab
 .cxx/
+
+# Sideloading toolchain — cloned locally, never vendored. It carries its own
+# .git and a large downloaded zip, and has no business in this repository.
+Legacy-iOS-Kit/
+art/
