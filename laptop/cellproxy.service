@@ -1,0 +1,20 @@
+[Unit]
+Description=Tunnel this laptop's traffic through the iPhone's cellular data
+Documentation=https://github.com/aptitudepi/ios-hotspot-proxy-app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sing-box run -c /etc/sing-box/cellproxy.json
+Restart=on-failure
+RestartSec=2
+
+# Creating and configuring a TUN needs this and nothing more.
+# NoNewPrivileges blocks privilege escalation but does not block CAP_NET_ADMIN.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

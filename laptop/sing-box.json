@@ -1,0 +1,52 @@
+{
+  "$schema": "https://sing-box.sagernet.org/schema.json",
+
+  "log": { "level": "info", "timestamp": true },
+
+  "dns": {
+    "servers": [
+      {
+        "tag": "cellardns",
+        "type": "udp",
+        "server": "1.1.1.1",
+        "server_port": 53,
+        "detour": "proxy"
+      }
+    ],
+    "final": "cellardns",
+    "strategy": "ipv4_only"
+  },
+
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": ["172.19.0.1/30"],
+      "mtu": 1280,
+      "auto_route": true,
+      "strict_route": true,
+      "dns_mode": "hijack",
+      "route_exclude_address": ["10.42.0.0/24", "172.19.0.0/30", "127.0.0.0/8", "::1/128"]
+    }
+  ],
+
+  "outbounds": [
+    { "type": "socks", "tag": "proxy", "server": "10.42.0.10", "server_port": 9876, "version": "5" },
+    { "type": "direct", "tag": "direct" }
+  ],
+
+  "route": {
+    "rules": [
+      { "action": "reject", "ip_cidr": ["224.0.0.0/4", "ff00::/8"] },
+      { "action": "route", "outbound": "proxy" }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true,
+    "default_domain_resolver": "cellardns"
+  },
+
+  "experimental": {
+    "clash_api": { "external_controller": "127.0.0.1:9090" }
+  }
+}
