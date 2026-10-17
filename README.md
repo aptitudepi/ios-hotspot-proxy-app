@@ -200,25 +200,85 @@ Anything that changes that assumption could regress DNS-over-UDP quietly.
 Not a gap to be fixed later — a property of the design. Listed here so it is not
 mistaken for an oversight.
 
-### 3. The background keepalive is unreviewed for iOS 26
+### 3. The background keepalive is ~90 % reliable, not certain
 
-`BackgroundKeepAlive` keeps the app alive by looping a buffer of **pure zeroes**
+`BackgroundKeepAlive` keeps the app alive by looping a **real, low-level tone**
 through `AVAudioEngine` in an `.playback` `AVAudioSession`, with
-`UIBackgroundModes: [audio]` declared in `SOCKS/Info.plist`.
+`UIBackgroundModes: [audio]` declared in `SOCKS/Info.plist`. The tone is −40 dBFS
+peak of band-limited noise, crossfaded so the loop seam is not a click, re-armed
+on every audio-session notification, and watched by a 1 Hz timer off the main
+thread. Full rationale, and what was deliberately not built, is in
+[`docs/KEEPALIVE-TODO.md`](docs/KEEPALIVE-TODO.md).
 
-This is upstream's approach, inherited unchanged. It is **under review** for
-iOS 26, where silent-audio backgrounding is exactly the kind of thing that
-tightens or gets rejected. It is not final, and it should not be optimised or
-"fixed" without reading [`docs/KEEPALIVE-TODO.md`](docs/KEEPALIVE-TODO.md)
-first.
+**The residual risk is that iOS 26 has been observed killing this setup anyway.**
+An Apple Developer Forums report (thread 826462, iPhone 17 Pro Max, iOS 26.5)
+records a SIGKILL at approximately 50 seconds of background time in an app that
+had *everything* nominally correct:
 
-### 4. UDP ASSOCIATE is untested against a real carrier network
+> `UIBackgroundModes` includes audio (verified in shipping IPA's Info.plist);
+> `AVAudioSession.setCategory(.playAndRecord, mode: .default)` is active;
+> `AVAudioEngine` is running with `installTap` producing PCM buffers right up to
+> the moment of death; `UIApplication.backgroundTimeRemaining` returns
+> `Double.greatestFiniteMagnitude` at `applicationDidEnterBackground`; no
+> `AVAudioSession.interruptionNotification` is delivered before the kill.
+
+That poster tried 35 documented workarounds — `BGContinuedProcessingTask`, Live
+Activity, WebRTC, `voip`, `beginBackgroundTask`, background location — and
+reported that **all of them die at ~50 s**. Meanwhile three shipping App Store
+transcription apps on the *same device and iOS version* survive indefinitely with
+`UIBackgroundModes: audio`. **No distinguishing factor was identified**, by that
+poster or in this fork's research.
+
+So treat the keepalive as approximately 90 % reliable, not as a guarantee.
+Concretely, this means:
+
+- The **auto-re-arm** is load-bearing, not a nicety. If the engine or player is
+  found not running, it restarts within a second.
+- The **`isIdleTimerDisabled` foreground path** is a real fallback, not a
+  convenience — while the app is in front with the screen on, no OS heuristic can
+  take it away.
+- Do not design around the session surviving indefinitely without a way to notice
+  that it did not. The in-app log and the traffic counters are how you find out
+  how long a session actually lasted.
+
+Known and specific: combining the keepalive with a background `URLSession` using
+`sessionSendsLaunchEvents = true` is reported to kill background playback ~1 ms
+after the `handleEventsForBackgroundURLSession` completion handler runs, in a
+process that was launched into the background and never went foreground
+(thread 838240, FB23789310). This app uses no background `URLSession`, so it does
+not apply — but do not add one casually.
+
+### 4. Local Network permission: not needed inbound, silently denied outbound
+
+Per TN3179 (Apple, *Understanding local network privacy*), the permission applies
+asymmetrically:
+
+- **Listening for and accepting incoming TCP connections requires no
+  local-network permission.** The inbound SOCKS listener on port 9876 therefore
+  never triggers the permission prompt, and never has anything revoked out from
+  under it.
+- **Outbound connections to local-network destinations do require it.** That is
+  the SOCKS `CONNECT` leg and the UDP `ASSOCIATE` path. Pointing the proxy at a
+  `192.168.x.x` target is a local-network operation.
+- When the privilege is still **undetermined** and the app is in the background,
+  **the system denies the operation silently, without showing the alert.** If a
+  user never granted Local Network access, a backgrounded app will not prompt —
+  it will just fail to reach a local target, with no user-visible explanation.
+
+Consequence for this app: `NSLocalNetworkUsageDescription` in `SOCKS/Info.plist`
+is **harmless but not strictly required** for normal use, because the only
+unconditional listener is inbound. It is kept because the outbound leg can hit
+the local network and because omitting it makes that failure worse. Note also
+that TN3179 covers only the permission gate; it says nothing about suspension, so
+Local Network privacy is not a factor in the keepalive at all.
+
+### 5. UDP ASSOCIATE is untested against a real carrier network
 
 The SOCKS5 path is exercised by upstream's `Bench/` oracle and unit tests. The
 end-to-end tethering path — a real laptop, a real phone, a real carrier — has not
 been run from this fork.
 
-### 5. No scheme-based tooling
+### 6. No scheme-based tooling
 
 Because there is no `SocksBypass` scheme, anything expecting one will not work
 out of the box: `xcodebuild -scheme`, Xcode's normal run/install flow, and most

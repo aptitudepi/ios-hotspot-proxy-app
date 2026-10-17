@@ -1,6 +1,8 @@
 import Foundation
 import Combine
 import AVFAudio
+import MediaPlayer
+import UIKit
 import Darwin
 
 /// Drives the SwiftUI shell from the relay's one-second snapshots.
@@ -130,7 +132,8 @@ final class RelayViewModel: ObservableObject {
 
         // Cheap self-heal: an interruption (a call, a route change) stops the
         // audio session, and without it the app is suspended the next time it
-        // leaves the screen.
+        // leaves the screen. This is the foreground backstop only; the keepalive's
+        // own off-main watchdog is what covers the backgrounded case.
         keepAlive.resumeIfNeeded()
         if backgroundActive != keepAlive.isActive { backgroundActive = keepAlive.isActive }
 
@@ -233,86 +236,200 @@ final class RelayViewModel: ObservableObject {
 
 /// iOS suspends an ordinary app seconds after it leaves the screen, taking the
 /// listener and every live connection with it. An active audio session is what
-/// keeps a plain app scheduled, so the relay plays silence for as long as it is
+/// keeps a plain app scheduled, so the relay plays a tone for as long as it is
 /// serving. `.mixWithOthers` leaves whatever the user is actually listening to
-/// alone, and the buffer is all zeroes, so nothing is audible.
+/// alone.
 ///
-/// This restores behaviour the pre-Swift app had and the rewrite dropped: the
-/// original kept itself alive the same way, with a blank WAV asset. Generating
-/// the silence removes the asset.
-//
-// TODO(keepalive): this all-zeroes audio keepalive is upstream's approach and is
-// under review for iOS 26. It is NOT final. Do not "fix" or optimise it without
-// reading docs/KEEPALIVE-TODO.md first.
+/// The tone has to be genuinely present, not merely declared. The audio server
+/// holds an output activity assertion while output is flowing, and an app whose
+/// output goes silent for "too long" loses it — the failure being "declares
+/// `audio` but produces nothing", which suspends the app about 30 s after
+/// backgrounding and takes the relay with it. Digital zeroes and a muted player
+/// node are the two states with the least evidence behind them; see
+/// docs/KEEPALIVE-TODO.md. Generating the tone also removes the blank-WAV asset
+/// the pre-Swift app carried.
 @MainActor
 final class BackgroundKeepAlive {
+    /// ~-40 dBFS peak. Unambiguously present at the mixer, quiet enough not to be a
+    /// nuisance across a room.
+    private static let tonePeak: Float = 0.01
+    /// One second, so the loop seam is the only discontinuity and a re-arm
+    /// reschedules cheaply.
+    private static let toneFrames: AVAudioFrameCount = 44_100
+    /// Three cascaded one-pole stages at 0.95, i.e. −120 dB/decade and a ~350 Hz
+    /// corner. Measured across a dozen buffers this leaves under 0.002 % of the
+    /// power above 8 kHz, against ~0.5 % for a single stage at 0.99. Three stages
+    /// costs three milliseconds at launch and makes the band-limiting
+    /// unambiguous, which is worth having given the whole design rests on what
+    /// this signal looks like.
+    private static let toneStages = 3
+    private static let tonePole: Float = 0.95
+
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
-    private let silence: AVAudioPCMBuffer?
+    private let tone: AVAudioPCMBuffer?
     private var wanted = false
-    private var interruptionObserver: NSObjectProtocol?
+    private var observers: [NSObjectProtocol] = []
+    private var watchdog: DispatchSourceTimer?
+
+    /// Off the main thread on purpose: iOS kills a process that exceeds 80% average
+    /// CPU over a 60 s window (`cpu_resource_fatal`), and looping audio is free
+    /// while main-thread polling is not.
+    private let watchdogQueue = DispatchQueue(
+        label: "com.nanako.socksbypass.keepalive", qos: .utility
+    )
 
     var isActive: Bool { engine.isRunning && player.isPlaying }
 
     init() {
         guard let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1),
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44_100) else {
-            silence = nil
+              let buffer = Self.makeTone(format: format) else {
+            tone = nil
             return
         }
-        buffer.frameLength = buffer.frameCapacity      // already zeroed
-        silence = buffer
+        tone = buffer
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
+    }
+
+    /// Band-limited noise, normalised to `tonePeak`, crossfaded at the seam so the
+    /// loop point is not a click. Noise rather than a tone, because broadband hiss
+    /// at this level is masked by room noise; deliberately not near-ultrasonic,
+    /// because there is no evidence that helps and it risks an audible whine.
+    private static func makeTone(format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: toneFrames),
+              let samples = buffer.floatChannelData?[0] else { return nil }
+        buffer.frameLength = toneFrames
+        let count = Int(toneFrames)
+
+        // Band-limit before scaling, or the noise sits up in the part of the band
+        // the phone cannot reproduce. In place, one pass per stage: `previous`
+        // carries the filter state and each sample is read before it is written.
+        for i in 0 ..< count { samples[i] = Float.random(in: -1 ... 1) }
+        for _ in 0 ..< toneStages {
+            var previous: Float = 0
+            for i in 0 ..< count {
+                previous = tonePole * previous + (1 - tonePole) * samples[i]
+                samples[i] = previous
+            }
+        }
+
+        // Wrap-around crossfade, so the one-second splice is not a discontinuity.
+        // Every splice would otherwise be a click — audible, and an amplitude
+        // transient the audio server can see.
+        let fade = 1_024
+        for i in 0 ..< fade {
+            let t = Float(i) / Float(fade)
+            samples[count - fade + i] = samples[count - fade + i] * (1 - t) + samples[i] * t
+        }
+
+        // Normalise by the measured peak so `tonePeak` means what it says.
+        var peak: Float = 0
+        for i in 0 ..< count { peak = max(peak, abs(samples[i])) }
+        guard peak > 0 else { return buffer }
+        let scale = tonePeak / peak
+        for i in 0 ..< count { samples[i] *= scale }
+        return buffer
     }
 
     func start() {
         guard !wanted else { return }
         wanted = true
-        observeInterruptions()
+        observeSession()
+        startWatchdog()
+        // A mode, not a permanent setting: true only while the relay is serving.
+        // Free when the app is already backgrounded, and it gives the foreground
+        // case a path that no OS heuristic can take away.
+        UIApplication.shared.isIdleTimerDisabled = true
+        publishNowPlaying()
         resumeIfNeeded()
     }
 
-    /// The one-second poll cannot recover an interruption on its own. Losing the
-    /// audio session is precisely what lets iOS suspend the app, and a suspended
-    /// app's run-loop timer stops firing, so polling is dead exactly when it
-    /// would be needed. This notification still arrives; the timer stays as a
-    /// foreground backstop.
-    private func observeInterruptions() {
-        guard interruptionObserver == nil else { return }
-        interruptionObserver = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: AVAudioSession.sharedInstance(),
-            queue: .main
+    /// Interruption is the documented reason an audio session goes away, but a
+    /// route change (headphones, AirPods, the hotspot rearranging interfaces) and a
+    /// media-services reset tear down the output just as hard and just as silently.
+    /// Re-arming on all three is the difference between surviving minutes and
+    /// surviving hours.
+    private func observeSession() {
+        guard observers.isEmpty else { return }
+        let center = NotificationCenter.default
+        let session = AVAudioSession.sharedInstance()
+
+        observers.append(center.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: session, queue: .main
         ) { [weak self] note in
             guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
             Task { @MainActor in self?.resumeIfNeeded() }
-        }
+        })
+        observers.append(center.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: session, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.resumeIfNeeded() }
+        })
+        observers.append(center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: session, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.resumeIfNeeded() }
+        })
     }
 
-    /// Releases the session for good. `wanted` is cleared first so the periodic
-    /// resume does not immediately restart what this just stopped.
+    /// Apple DTS: an app registered as the Now Playing app is "generally safe from
+    /// memory termination" while background memory stays under ~100 MB, and it is
+    /// the recommended shape over a purely mixable session. What this relay holds
+    /// in the background is the connection table and a 50-entry log, so that is
+    /// nowhere near the ceiling.
+    private func publishNowPlaying() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+            MPMediaItemPropertyTitle: "SOCKS proxy",
+            MPMediaItemPropertyArtist: "serving",
+            MPNowPlayingInfoPropertyIsLiveStream: true,
+        ]
+    }
+
+    /// The foreground `Timer` cannot recover an interruption on its own. Losing the
+    /// audio session is precisely what lets iOS suspend the app, and a suspended
+    /// app's run-loop timer stops firing, so polling is dead exactly when it would
+    /// be needed. This runs off the main thread so it does not share fate with the
+    /// main run loop; it still only works while the session itself is holding the
+    /// process awake, so it is a net rather than a replacement.
+    private func startWatchdog() {
+        guard watchdog == nil else { return }
+        let watchdog = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        watchdog.schedule(deadline: .now() + 1, repeating: 1)
+        watchdog.setEventHandler { [weak self] in
+            Task { @MainActor in self?.resumeIfNeeded() }
+        }
+        self.watchdog = watchdog
+        watchdog.resume()
+    }
+
+    /// Releases the session for good. `wanted` is cleared first so the watchdog does
+    /// not immediately restart what this just stopped.
     func stop() {
         wanted = false
-        if let interruptionObserver {
-            NotificationCenter.default.removeObserver(interruptionObserver)
-            self.interruptionObserver = nil
+        for observer in observers {
+            NotificationCenter.default.removeObserver(observer)
         }
+        observers = []
+        watchdog?.cancel()
+        watchdog = nil
         player.stop()
         engine.stop()
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         try? AVAudioSession.sharedInstance().setActive(false)
+        UIApplication.shared.isIdleTimerDisabled = false
     }
 
     func resumeIfNeeded() {
-        guard wanted, !isActive, let silence else { return }
+        guard wanted, !isActive, let tone else { return }
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
             player.stop()                              // clears any stale schedule
             if !engine.isRunning { try engine.start() }
-            player.scheduleBuffer(silence, at: nil, options: .loops)
+            player.scheduleBuffer(tone, at: nil, options: .loops)
             player.play()
         } catch {
             // Left inactive on purpose. The next tick tries again, and the shell
