@@ -40,3 +40,7 @@ android/captures/
 # .git and a large downloaded zip, and has no business in this repository.
 Legacy-iOS-Kit/
 art/
+
+# System-wide tunnel config: embeds an SSH private key inline, because sing-box's
+# ssh outbound takes key CONTENT rather than a path. Never commit the real one.
+laptop/sing-box-ish.json

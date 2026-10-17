@@ -1,0 +1,54 @@
+{
+  "$schema": "https://sing-box.sagernet.org/schema.json",
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "cellardns",
+        "type": "udp",
+        "server": "1.1.1.1",
+        "server_port": 53,
+        "detour": "ssh-out"
+      }
+    ],
+    "final": "cellardns",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "mtu": 1280,
+      "auto_route": true,
+      "strict_route": true,
+      "dns_mode": "hijack",
+      "route_exclude_address": [
+        "10.42.0.0/24",
+        "172.19.0.0/30",
+        "127.0.0.0/8",
+        "::1/128"
+      ]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "ssh",
+      "tag": "ssh-out",
+      "server": "10.42.0.10",
+      "server_port": 2222,
+      "user": "root",
+      "private_key": "REPLACE: sing-box inlines the key CONTENT here, not a path."
+    }
+  ],
+  "route": {
+    "final": "ssh-out",
+    "auto_detect_interface": true
+  }
+}
