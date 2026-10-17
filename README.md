@@ -46,7 +46,7 @@ hotspot → phone connects to it.
   │   access pt  │ ◀──────────────────── │  0.0.0.0:9876            │
   └──────────────┘   SOCKS5 over LAN     └────────────┬─────────────┘
        │                                             │ cellular
-       │  SOCKS5_PROXY=http://<phone-ip>:9876        ▼
+       │  SOCKS5_PROXY=socks5h://<phone-ip>:9876    ▼
        └──────────────────────────────────▶    carrier → internet
 ```
 
@@ -74,7 +74,7 @@ same guarantee from a heuristic into an enforced one.
 5. On the **laptop**, point your client at it:
 
    ```bash
-   export SOCKS5_PROXY=http://192.168.x.y:9876   # the iPhone's address
+   export SOCKS5_PROXY=socks5h://192.168.x.y:9876   # the iPhone's address
    curl --socks5-hostname 192.168.x.y:9876 https://ifconfig.co
    ```
 
@@ -145,35 +145,153 @@ Same flags, same result. It prints the exact path of the `.ipa` it produced.
 Both paths emit `SocksBypass-unsigned.ipa`, which is a zip containing
 `Payload/SocksBypass.app`. It is unsigned and will not install as-is.
 
-## Signing and installing on Linux
+## Install and keep it installed: SideStore
 
-The reason CI holds no credentials: a **free Apple ID** can sign an app for
-**7 days**, and that signing happens entirely on your machine, on Linux.
+The reason CI holds no credentials: a **free Apple ID** signs an app for only
+**7 days**, and signing cannot be automated on a free account (see
+[Why not sign in CI](#why-not-sign-in-ci)). Left alone, that means a weekly
+manual ritual.
 
-1. **Enable Developer Mode on the iPhone.** Settings → Privacy & Security →
-   Developer Mode. This is required for any sideloaded app. The phone will ask
-   you to reboot.
+**SideStore removes the ritual entirely, and it costs nothing.**
 
-2. **Get [Legacy iOS Kit](https://github.com/LukeZGD/Legacy-iOS-Kit) and
-   [PlumeImpactor](https://github.com/LukeZGD/PlumeImpactor).** Both run on
-   Linux. Legacy iOS Kit handles the signing; PlumeImpactor does the install.
+[SideStore](https://sidestore.io/) is MIT-licensed and free forever — no
+premium tier. (If you have seen a paid "AltStore Premium" at $10/year, that is a
+different product; SideStore is a fork of AltStore that exists specifically to
+drop that upsell *and* the tethered-computer requirement.) SideStore is an app
+on the phone that re-signs and re-installs other apps using your Apple ID,
+refreshing them over Wi-Fi before the 7-day profile lapses.
 
-3. **Sign `SocksBypass-unsigned.ipa`** with your Apple ID:
+The 7-day expiry still exists in Apple's terms. SideStore just handles it without
+you. **No credentials live on your Linux box and none live in CI.** That is what
+turns this from a weekend experiment into something you can leave running.
+
+### Prerequisites
+
+- iOS 15.0 or newer, **with a passcode set** — SideStore requires one.
+- `LocalDevVPN` from the App Store. It must be connected during installs and
+  refreshes.
+- **Wi-Fi only.** The refresh path is unsuitable over mobile data.
+- [`iloader`](https://github.com/nab138/iloader) on a desktop machine. It is
+  MIT-licensed and **Linux is supported**.
+- Developer Mode enabled on the iPhone: Settings → Privacy & Security →
+  Developer Mode. The phone asks you to reboot.
+
+### One-time setup
+
+1. Install `iloader` and plug the iPhone in over USB.
+2. Sign in with your Apple ID. **This is the only time the Apple ID is ever typed
+   on your Linux machine.**
+3. `iloader` installs SideStore and pairs the device so SideStore can install
+   for itself.
+4. Install and keep `LocalDevVPN` connected.
+
+`iloader`'s UI steps vary by version; follow its own README for the exact
+sequence rather than trusting a transcription of it here.
+
+### Install this app, and every refresh after it
+
+1. Download the unsigned `.ipa` from a CI run:
 
    ```sh
-   ./Sign_ipa.sh SocksBypass-unsigned.ipa -p
+   gh run download <run-id> -D ./art
    ```
 
-4. **Install it with PlumeImpactor.** Plug the phone in over USB, trust the
-   computer, and either run PlumeImpactor's GUI or drive it from the CLI.
+   Run it **from inside a git repo**, or pass `-R <owner/repo>`. Otherwise it
+   fails with `fatal: not a git repository`.
+
+2. Get the file onto the phone. Any method that lands it in the **Files** app
+   works — AirDrop, iCloud Drive, a cable — because SideStore imports from there.
+
+3. In SideStore: **My Apps** → **`+`** → pick the `.ipa`. SideStore signs and
+   installs it on the device.
+
+4. Confirm it works: the app should display the address and port your laptop
+   should dial, default **9876**.
+
+Then **do nothing.** SideStore refreshes over Wi-Fi in the background.
+
+Two things to know about the refresh:
+
+- **Keep the bundle ID fixed.** Free accounts get 10 App IDs per 7 days;
+  re-signing the same bundle ID reuses the same App ID. Changing it burns a new
+  one every time.
+- **Keep `LocalDevVPN` connected.** Without it, refreshes fail.
+
+If a refresh ever does fail, the fix is to re-import the `.ipa` from the Files
+app.
+
+> **Gotcha, if your own internet is proxied.** `gh` is a Go binary, and Go's
+> HTTP client honours `HTTPS_PROXY` — **not** `ALL_PROXY`. If your only route to
+> the internet is a SOCKS proxy, `gh` will report `error connecting to
+> api.github.com` and then `gh auth status` will claim your token is invalid.
+> Both messages are lies. Set `HTTPS_PROXY` as well.
+
+## Fallback: signing and installing on Linux
+
+If SideStore does not suit you, the next best thing is a weekly command. It is
+still better than signing by hand, because the credential is cached after the
+first use.
+
+1. **Enable Developer Mode on the iPhone.** Settings → Privacy & Security →
+   Developer Mode.
+
+2. **Get [Legacy iOS Kit](https://github.com/LukeZGD/Legacy-iOS-Kit).** It runs
+   on Linux and drives [Plumesign](https://github.com/declaration/Impactor) for
+   the signing half. (The old `khcrysalis/PlumeImpactor` URL redirects there.)
+
+3. **Run it**, choose **Sideload IPA**, select `SocksBypass-unsigned.ipa`, then
+   **Install IPA using Plumesign**. Trust the computer when the phone asks,
+   enter your Apple ID and password, and a 2FA code if prompted.
+
+4. **Trust the profile:** Settings → General → VPN & Device Management.
+
+Linux prerequisites: `usbmuxd` installed, and the phone plugged in before you
+start — on distros where udev rules interfere, the device is not seen otherwise.
+iTunes is not required on Linux. **Sideloadly is not available on Linux**; do
+not go looking for it.
+
+### Why the weekly part is just a command
+
+After the first login, Plumesign stores a session in
+`~/.config/PlumeImpactor/accounts.json`, and signing reuses it with
+`sign --apple-id` **without re-prompting for the password or a 2FA code**. So you
+type a 2FA code once, not weekly.
+
+**The wart:** that stored session has **no tracked expiry field**. Plumesign
+discovers it when Apple rejects the token, at which point you get a surprise
+2FA prompt at an unpredictable cadence. That is the main operational downside of
+this path and the reason SideStore is preferred.
+
+(When a code *is* needed it is read from **stdin** — there is no CLI flag for
+it. Pipeable, but not flaggable.)
 
 ### Know the 7-day expiry
 
 A free-Apple-ID signature **expires after 7 days**, at which point the app stops
-launching and must be signed and reinstalled. There is no workaround short of a
-paid Apple Developer account ($99/year), which signs for a year and removes the
-weekly ritual. For an app that sits on a bench as a tethering tool, the weekly
-resign is usually tolerable; pick the paid account if it is not.
+launching until it is signed and reinstalled. The only ways out are SideStore,
+which handles it for you, or a paid Apple Developer account at $99/year, which
+signs for a year. SideStore gets you there for free.
+
+## Why not sign in CI
+
+This comes up, so the short version:
+
+- **A free Apple ID's second factor is required at Apple's _login_ step**, not
+  the signing step, and a human reads it off a device. It cannot be stored.
+- **The 2FA code rotates every ~30 seconds**, so there is nothing static to bake
+  into a workflow.
+- **Anisette** — the iTunes-fingerprint blob these tools use — is *not* a
+  substitute for the second factor. It is required on every request and comes
+  from third-party servers that see your IP. Community anisette servers have
+  historically caused Apple ID lockouts.
+- **CI could never install the app anyway.** Signing is only half the operation;
+  installing needs the physical device. "Sign in CI, then sideload" was always
+  two steps, and the sideload step is unavoidably local. SideStore is the only
+  option that collapses both halves into the device.
+- **A paid account does fix the signing half** — `plumesign sign --pem-files …
+  --provision …` is fully offline, with no login, no anisette and no 2FA — but
+  it costs $99/year and still does not remove the local install step. It buys
+  less than SideStore for this goal.
 
 ## Known gaps
 
@@ -284,6 +402,25 @@ Because there is no `SocksBypass` scheme, anything expecting one will not work
 out of the box: `xcodebuild -scheme`, Xcode's normal run/install flow, and most
 CI templates. Use `-target` (see [Build](#build)). The upstream
 `SocksBypass-Benchmark` scheme and the Android tree are not part of this fork.
+
+### 7. SideStore is a dependency, and it is not free of constraints
+
+The install path depends on a third-party app
+([SideStore](https://sidestore.io/)), which is free and MIT-licensed but outside
+our control. Two standing costs: **LocalDevVPN must be connected** for installs
+and refreshes to work at all, and free accounts get **3 app slots total
+including SideStore itself**. We use one, so the budget is comfortable — but this
+app cannot be a fourth sideload. If SideStore breaks on a future iOS release,
+the [Linux fallback](#fallback-signing-and-installing-on-linux) is the way back.
+
+### 8. The laptop side needs its own proxy configuration
+
+The phone serving SOCKS5 is half of the story. Getting *every* process on the
+laptop through it — including applications that ignore proxy settings, which is
+what most games do — needs a local TUN device and a translator such as
+`sing-box`. That is deliberately **not** part of this repository, which builds
+the phone app only. Until it is set up, expect to route proxy-aware clients
+individually.
 
 ## Upstream and license
 
