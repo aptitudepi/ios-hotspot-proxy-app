@@ -32,22 +32,49 @@ direct connection not established
 
 ## The blocker
 
-Tailscale peers locate each other by exchanging **endpoint lists** through the
-coordination server. A direct connection is only attempted against endpoints the
-peer published. The iPhone published none:
+Tailscale carries traffic over a **direct WireGuard path**, which requires NAT
+traversal: each node publishes the endpoints it can be reached on, and each peer
+attempts those. So the question is what the iPhone published.
+
+`tailscale status --json` showed the peer advertising exactly two endpoints:
+
+| Endpoint | What it is | Reachable from this laptop? |
+| --- | --- | --- |
+| `172.58.52.207:65491` | its T-Mobile CGNAT address | no uplink |
+| `192.0.0.2:41641` | Tailscale's "unknown public" placeholder | no |
+
+**It did not advertise `10.42.0.10:41641`, its address on the shared LAN.**
+
+`tailscaled` logs confirm it tried what it had, and the kernel refused both:
 
 ```
-Addrs:    None
-CurAddr:  ''
-Relay:    dfw
+magicsock: ping(100.89.44.26): sending disco ping to [Zpx1Q] iphone183 ...
+disco: failed to send ping to 172.58.52.207:65491: sendto: network is unreachable
+disco: failed to send ping to 192.0.0.2:41641:   sendto: network is unreachable
 ```
 
-The phone was verified to be on the laptop's access point — ARP `REACHABLE` at
-`10.42.0.10` with a randomised iOS MAC. So this is not a topology mistake.
+This laptop does advertise its own LAN endpoint — `Self.Addrs` includes
+`10.42.0.1:41641` — and Tailscale did act on it. Capturing `wlan0` shows the
+laptop sending WireGuard packets straight at the phone:
 
-There is also **no Local Network entry for Tailscale in iOS Settings**, because the
-packet-tunnel extension never requests one. Without local-network access it cannot
-perform LAN discovery, so it never learns or advertises its `wlan0` address.
+```
+01:41:38 IP 10.42.0.1.41641 > 10.42.0.10.41641: UDP, length 124
+01:41:39 IP 10.42.0.1.41641 > 10.42.0.10.41641: UDP, length 124
+01:41:40 IP 10.42.0.1.41641 > 10.42.0.10.41641: UDP, length 124
+01:41:44 IP 10.42.0.1.41641 > 10.42.0.10.41641: UDP, length 124
+```
+
+and, over that window, **nothing came back**. Not a single inbound packet.
+
+The phone is reachable at that address — ARP is `REACHABLE` and ICMP ping answers,
+so the access point is not isolating clients and the packets are arriving. The
+phone's Tailscale simply does not answer WireGuard arriving on the local network.
+There is also no Local Network entry for Tailscale in iOS Settings, because the
+packet-tunnel extension never requests that permission, so it has no local-network
+access to speak of.
+
+That is the whole failure. It is a platform limitation on iOS, not something that
+can be configured away from the Linux side.
 
 ## Why DERP is not a fallback here
 
